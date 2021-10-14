@@ -3,9 +3,8 @@ use std::io::Read;
 use std::thread;
 use std::time::Duration;
 use thiserror::Error;
-use crate::Chip8Error::IllegalInstruction;
 
-static SPRITE_FOR_CHARS: [i32; 80] = [
+static SPRITE_FOR_CHARS: [u8; 80] = [
     0xF0, 0x90, 0x90, 0x90, 0xF0, // 0
     0x20, 0x60, 0x20, 0x20, 0x70, // 1
     0xF0, 0x10, 0xF0, 0x80, 0xF0, // 2
@@ -59,6 +58,30 @@ enum Chip8Error {
 }
 
 impl Chip8 {
+    pub fn new(program: &[u8]) -> Self {
+        let mut chip8 = Self {
+            mem: [0; 4096],
+            registers: Default::default(),
+            address_register: 0,
+            pc: 0,
+            stack: Default::default(),
+            stack_pointer: 0,
+            display: [[0; 8]; 32],
+            current_key: 0,
+            delay_timer: 0,
+            sound_timer: 0
+        };
+        // Copy sprites to memory
+        for i in 0..SPRITE_FOR_CHARS.len() {
+            chip8.mem[i] = SPRITE_FOR_CHARS[i] as u8;
+        }
+        // Copy program to memory starting by memory address 512
+        for i in 0..program.len() {
+            chip8.mem[512+i] = program[i]
+        }
+        chip8
+    }
+
     /// Loads an opcode from memory by fetching two bytes and combing them in big-endian fashion.
     fn load_opcode(&self) -> u16 {
         // Instructions are stored in big endian, so the most significant byte is placed at the byte with the lowest
@@ -69,22 +92,28 @@ impl Chip8 {
         opcode
     }
 
+    fn get_program_mem_mut(&mut self) -> &mut [u8] {
+        // The first 512 bytes belong to the interpreter
+        &mut self.mem[512..]
+    }
+
     fn print_display(&self) {
         for row in self.display {
             for mut cell in row {
-                for i in 0..8 { // Loop through the byte
-                    let pixel = cell & 0x80 != 0; // Extract each pixel
+                for _ in 0..8 { // Loop through each bit of the byte
+                    // Extract each bit. Get most significant bit first
+                    let pixel = cell & 0x80 != 0;
                     cell <<= 1;
                     match pixel {
-                        true => print!("X"),
-                        false => print!(" "),
+                        true => print!("█ "),
+                        false => print!("  "),
                     }
                 }
             }
             println!();
         }
         // Go up to the beginning of the display with ansi escape code
-        println!("{}", "\033[F".repeat(self.display.len()));
+        print!("{}", "\x1b[F".repeat(self.display.len()));
     }
 
     fn run(&mut self) {
@@ -93,7 +122,7 @@ impl Chip8 {
             self.print_display();
             self.sound_timer.saturating_sub(1);
             self.delay_timer.saturating_sub(1);
-            thread::sleep(Duration::from_secs_f64(1.0 / 60.0)); // Run at 60Hz
+            // thread::sleep(Duration::from_secs_f64(1.0 / 60.0)); // Run at 60Hz
         }
     }
 
@@ -106,7 +135,7 @@ impl Chip8 {
             0x0 => match opcode & 0x00FF {
                 0x00 => self.call_machine_routine(opcode),
                 0xE0 => self.clear_display(),
-                _ => Err(IllegalInstruction {opcode, pc: self.pc}),
+                _ => Err(Chip8Error::IllegalInstruction { opcode, pc: self.pc }),
             },
             0x1 => self.jump(opcode),
             0x2 => self.call_subroutine(opcode),
@@ -126,7 +155,7 @@ impl Chip8 {
                 0x6 => self.right_shift_vx(opcode),
                 0x7 => self.set_vx_to_vy_minus_vx(opcode),
                 0xE => self.left_shift_vx(opcode),
-                _ => Err(IllegalInstruction {opcode, pc: self.pc})
+                _ => Err(Chip8Error::IllegalInstruction { opcode, pc: self.pc })
             },
             0x9 => self.skip_if_vx_ne_vy(opcode),
             0xA => self.set_i_addr_to_n(opcode),
@@ -137,9 +166,9 @@ impl Chip8 {
             0xE => match opcode & 0x00FF {
                 0x9E => self.skip_if_key_in_vk_pressed(opcode),
                 0xA1 => self.skip_if_key_in_vk_not_pressed(opcode),
-                _ => Err(IllegalInstruction {opcode, pc: self.pc})
+                _ => Err(Chip8Error::IllegalInstruction { opcode, pc: self.pc })
             }
-            _ => Err(IllegalInstruction {opcode, pc: self.pc}),
+            _ => Err(Chip8Error::IllegalInstruction { opcode, pc: self.pc }),
         }
     }
 
@@ -208,10 +237,10 @@ impl Chip8 {
     /// Skip next instruction if vx (register) == vy (register). Opcode: `5XY0` - `SE vx, vy`.
     fn skip_if_vx_eq_vy(&mut self, opcode: u16) -> Result<(), Chip8Error> {
         // Get number of the registers vx and vy
-        let vx_number = (opcode & 0x0F00) >> 8;
+        let vx = (opcode & 0x0F00) >> 8;
         let vy_number = (opcode & 0x00F0) >> 4;
         // Get their values
-        let vx_value = self.registers[vx_number as usize];
+        let vx_value = self.registers[vx as usize];
         let vy_value = self.registers[vy_number as usize];
         if vx_value == vy_value {
             self.pc += 1;
@@ -222,27 +251,27 @@ impl Chip8 {
 
     /// vx = n., i.e. put value nn into register vx. Opcode: `6XNN` - `LD vx, byte`.
     fn set_vx_to_n(&mut self, opcode: u16) -> Result<(), Chip8Error> {
-        let vx_number = (opcode & 0x0F00) >> 8;
+        let vx = (opcode & 0x0F00) >> 8;
         let number_in = opcode & 0x00FF;
-        self.registers[vx_number as usize] = number_in as u8;
+        self.registers[vx as usize] = number_in as u8;
         self.pc += 1;
         Ok(())
     }
 
     /// vx += n, i.e. adds the constant n to register vx. Opcode: `7XNN` - `ADD vx, byte`.
     fn add_n_to_vx(&mut self, opcode: u16) -> Result<(), Chip8Error> {
-        let vx_number = (opcode & 0x0F00) >> 8;
+        let vx = (opcode & 0x0F00) >> 8;
         let number_in = opcode & 0x00FF;
-        self.registers[vx_number as usize] += number_in as u8;
+        self.registers[vx as usize] += number_in as u8;
         self.pc += 1;
         Ok(())
     }
 
     /// vx = vy, i.e. sets register vx to the value of register vy. Opcode: `8XY0` - `LD vx, vy`.
     fn set_vx_to_vy(&mut self, opcode: u16) -> Result<(), Chip8Error> {
-        let vx_number = (opcode & 0x0F00) >> 8;
+        let vx = (opcode & 0x0F00) >> 8;
         let vy_number = (opcode & 0x00F0) >> 4;
-        self.registers[vx_number as usize] = self.registers[vy_number as usize];
+        self.registers[vx as usize] = self.registers[vy_number as usize];
         self.pc += 1;
         Ok(())
     }
@@ -278,6 +307,7 @@ impl Chip8 {
     fn add_vy_to_vx(&mut self, opcode: u16) -> Result<(), Chip8Error> {
         let vx = (opcode & 0x0F00) >> 8;
         let vy = (opcode & 0x00F0) >> 4;
+
         self.registers[vx as usize] += self.registers[vy as usize];
         self.pc += 1;
         Ok(())
@@ -324,10 +354,10 @@ impl Chip8 {
     /// Skip next instruction if vx (register) != vy (register). Opcode: `9XY0` - `SNE vx, vy`.
     fn skip_if_vx_ne_vy(&mut self, opcode: u16) -> Result<(), Chip8Error> {
         // Get number of the registers vx and vy
-        let vx_number = (opcode & 0x0F00) >> 8;
+        let vx = (opcode & 0x0F00) >> 8;
         let vy_number = (opcode & 0x00F0) >> 4;
         // Get their values
-        let vx_value = self.registers[vx_number as usize];
+        let vx_value = self.registers[vx as usize];
         let vy_value = self.registers[vy_number as usize];
         if vx_value != vy_value {
             self.pc += 1;
@@ -494,28 +524,11 @@ impl Chip8 {
     }
 }
 
-impl Default for Chip8 {
-    fn default() -> Self {
-        Self {
-            mem: [0; 4096],
-            registers: Default::default(),
-            address_register: 0,
-            pc: 0,
-            stack: Default::default(),
-            stack_pointer: 0,
-            display: [[0; 8]; 32],
-            current_key: 0,
-            delay_timer: 0,
-            sound_timer: 0
-        }
-    }
-}
-
 fn main() {
     let file_path = "src/PONG";
-    let mut file = File::open(file_path).expect("Can't open file");
-    let mut chip8 = Chip8::default();
-    file.read_exact(&mut chip8.mem);
-
+    let mut file = File::open(file_path).expect("Can't open program file");
+    let mut program = Vec::new();
+    file.read_to_end(&mut program).expect("Can't read program from file");
+    let mut chip8 = Chip8::new(&program);
     chip8.run();
 }
