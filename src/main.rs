@@ -1,5 +1,6 @@
 use std::fs::File;
 use std::io::Read;
+use std::error::Error;
 use std::thread;
 use std::time::Duration;
 use thiserror::Error;
@@ -46,15 +47,23 @@ struct Chip8 {
 
     delay_timer: u8,
     sound_timer: u8,
+
+    refresh_display: bool,
 }
 
 #[derive(Debug, PartialEq, Eq, Error)]
 enum Chip8Error {
-    #[error("encountered illegal instruction {opcode:#X} at pc {pc}")]
+    #[error("Encountered illegal instruction {opcode:#X} at PC={pc}")]
     IllegalInstruction {
         opcode: u16,
         pc: usize
     },
+
+    #[error("Stack overflow")]
+    StackOverflow,
+
+    #[error("Machine routine nr.{0} called, but is not implemented")]
+    UnknownMachineRoutine(u16),
 }
 
 impl Chip8 {
@@ -63,22 +72,21 @@ impl Chip8 {
             mem: [0; 4096],
             registers: Default::default(),
             address_register: 0,
-            pc: 0,
+            pc: 512,
             stack: Default::default(),
             stack_pointer: 0,
             display: [[0; 8]; 32],
             current_key: 0,
             delay_timer: 0,
-            sound_timer: 0
+            sound_timer: 0,
+            refresh_display: true,
         };
+
         // Copy sprites to memory
-        for i in 0..SPRITE_FOR_CHARS.len() {
-            chip8.mem[i] = SPRITE_FOR_CHARS[i] as u8;
-        }
+        chip8.mem[0x50..=0x9F].copy_from_slice(&SPRITE_FOR_CHARS);
+
         // Copy program to memory starting by memory address 512
-        for i in 0..program.len() {
-            chip8.mem[512+i] = program[i]
-        }
+        chip8.mem[512..512+program.len()].copy_from_slice(program);
         chip8
     }
 
@@ -86,9 +94,9 @@ impl Chip8 {
     fn load_opcode(&self) -> u16 {
         // Instructions are stored in big endian, so the most significant byte is placed at the byte with the lowest
         // address.
-        let upper = self.mem[self.pc] as u16;
-        let lower = self.mem[self.pc + 1] as u16;
-        let opcode = (upper << 8) | lower;
+        let upper = self.mem[self.pc];
+        let lower = self.mem[self.pc + 1];
+        let opcode = u16::from_be_bytes([upper, lower]);
         opcode
     }
 
@@ -100,13 +108,12 @@ impl Chip8 {
     fn print_display(&self) {
         for row in self.display {
             for mut cell in row {
-                for _ in 0..8 { // Loop through each bit of the byte
+                for bit in 0..8 { // Loop through each bit of the byte
                     // Extract each bit. Get most significant bit first
-                    let pixel = cell & 0x80 != 0;
-                    cell <<= 1;
+                    let pixel = (cell >> (7 - bit)) & 1 == 1;
                     match pixel {
-                        true => print!("█ "),
-                        false => print!("  "),
+                        true => print!("█"),
+                        false => print!(" "),
                     }
                 }
             }
@@ -116,18 +123,22 @@ impl Chip8 {
         print!("{}", "\x1b[F".repeat(self.display.len()));
     }
 
-    fn run(&mut self) {
+    fn run(&mut self) -> Result<(), Chip8Error> {
         for _ in 0..10000 {
-            self.exec_instruction();
+            self.exec_instruction()?;
             self.print_display();
-            self.sound_timer.saturating_sub(1);
-            self.delay_timer.saturating_sub(1);
-            // thread::sleep(Duration::from_secs_f64(1.0 / 60.0)); // Run at 60Hz
+            self.sound_timer = self.sound_timer.saturating_sub(1);
+            self.delay_timer = self.delay_timer.saturating_sub(1);
+            thread::sleep(Duration::from_secs_f64(1.0 / 60.0)); // Run at 60Hz
         }
+        Ok(())
     }
 
     fn exec_instruction(&mut self) -> Result<(), Chip8Error> {
+        self.refresh_display = false;
+
         let opcode = self.load_opcode();
+        self.pc += 2;
 
         // Match on the most significant hex digit in the opcode
         match (opcode & 0xF000) >> 12 {
@@ -135,6 +146,7 @@ impl Chip8 {
             0x0 => match opcode & 0x00FF {
                 0x00 => self.call_machine_routine(opcode),
                 0xE0 => self.clear_display(),
+                0xEE => self.subroutine_return(),
                 _ => Err(Chip8Error::IllegalInstruction { opcode, pc: self.pc }),
             },
             0x1 => self.jump(opcode),
@@ -168,21 +180,88 @@ impl Chip8 {
                 0xA1 => self.skip_if_key_in_vk_not_pressed(opcode),
                 _ => Err(Chip8Error::IllegalInstruction { opcode, pc: self.pc })
             }
+            0xF => match opcode & 0x00FF {
+                0x07 => self.set_vx_to_delay_timer(opcode),
+                0x0A => self.wait_for_key_press_and_store_in_vx(opcode),
+                0x15 => self.set_delay_timer_to_vx(opcode),
+                0x18 => self.set_sound_timer_to_vx(opcode),
+                0x1E => self.add_vx_to_i(opcode),
+                0x29 => self.set_i_to_sprite_addr(opcode),
+                0x33 => self.store_bcd_in_mem(opcode),
+                0x55 => self.store_v0_to_vx_in_mem(opcode),
+                0x65 => self.load_v0_to_vx_from_mem(opcode),
+                _ => Err(Chip8Error::IllegalInstruction { opcode, pc: self.pc })
+            },
             _ => Err(Chip8Error::IllegalInstruction { opcode, pc: self.pc }),
         }
+    }
+
+    fn wait_for_key_press_and_store_in_vx(&mut self, opcode: u16) -> Result<(), Chip8Error> {
+        let vx = ((opcode & 0x0F00) >> 8) as usize;
+        let mut line = String::new();
+        std::io::stdin().read_line(&mut line).unwrap();
+        self.registers[vx] = line.as_bytes()[0];
+        Ok(())
+    }
+
+    fn set_delay_timer_to_vx(&mut self, opcode: u16) -> Result<(), Chip8Error> {
+        let vx = ((opcode & 0x0F00) >> 8) as usize;
+        self.delay_timer = self.registers[vx];
+        Ok(())
+    }
+
+    fn set_sound_timer_to_vx(&mut self, opcode: u16) -> Result<(), Chip8Error> {
+        let vx = ((opcode & 0x0F00) >> 8) as usize;
+        self.sound_timer = self.registers[vx];
+        Ok(())
+    }
+
+    fn set_i_to_sprite_addr(&mut self, opcode: u16) -> Result<(), Chip8Error> {
+        let vx = ((opcode & 0x0F00) >> 8) as usize;
+        let sprite_addr = self.registers[vx] as usize * 5;
+        self.address_register = sprite_addr as u16;
+        Ok(())
+    }
+
+    fn store_bcd_in_mem(&mut self, opcode: u16) -> Result<(), Chip8Error> {
+        let vx = ((opcode & 0x0F00) >> 8) as usize;
+        let vx_val = self.registers[vx];
+        let hundreds = vx_val / 100;
+        let tens = (vx_val % 100) / 10;
+        let ones = vx_val % 10;
+        self.mem[self.address_register as usize] = hundreds;
+        self.mem[self.address_register as usize + 1] = tens;
+        self.mem[self.address_register as usize + 2] = ones;
+        Ok(())
+    }
+
+    fn load_v0_to_vx_from_mem(&mut self, opcode: u16) -> Result<(), Chip8Error> {
+        let vx = ((opcode & 0x0F00) >> 8) as usize;
+        for i in 0..=vx {
+            self.registers[i] = self.mem[self.address_register as usize + i];
+        }
+        Ok(())
+    }
+
+    fn store_v0_to_vx_in_mem(&mut self, opcode: u16) -> Result<(), Chip8Error> {
+        let vx = ((opcode & 0x0F00) >> 8) as usize;
+        for i in 0..=vx {
+            self.mem[self.address_register as usize + i] = self.registers[i];
+        }
+        Ok(())
     }
 
     /// Call machine routine. Opcode: `0NNN` - `SYS addr`.
     fn call_machine_routine(&mut self, opcode: u16) -> Result<(), Chip8Error> {
         let machine_routine_nr = opcode & 0x0FFF;
-        eprintln!("Call to machine routine {} ignored", machine_routine_nr);
-        self.pc += 1;
+        Err(Chip8Error::UnknownMachineRoutine(machine_routine_nr))?;
         Ok(())
     }
 
     /// Clears the display, i.e. sets all bytes to zero. Opcode: `00E0` - `CLS`.
     fn clear_display(&mut self) -> Result<(), Chip8Error> {
         self.display = Default::default();
+        self.refresh_display = true;
         Ok(())
     }
 
@@ -190,7 +269,6 @@ impl Chip8 {
     fn subroutine_return(&mut self) -> Result<(), Chip8Error> {
         self.pc = self.stack[self.stack_pointer as usize] as usize;
         self.stack_pointer -= 1;
-        self.pc += 1;
         Ok(())
     }
 
@@ -204,7 +282,8 @@ impl Chip8 {
     /// Call subroutine. Opcode: `2NNN` - `CALL addr`.
     fn call_subroutine(&mut self, opcode: u16) -> Result<(), Chip8Error> {
         self.stack_pointer += 1;
-        self.stack[self.stack_pointer as usize] = self.pc;
+        let stack_frame = self.stack.get_mut(self.stack_pointer as usize).ok_or(Chip8Error::StackOverflow)?;
+        *stack_frame = self.pc;
         let subroutine_mem_addr = opcode & 0x0FFF;
         self.pc = subroutine_mem_addr as usize;
         Ok(())
@@ -216,9 +295,7 @@ impl Chip8 {
         let register_value = self.registers[register_number as usize];
         let number_in = opcode & 0x00FF;
         if register_value == number_in as u8 {
-            self.pc += 1;
         }
-        self.pc += 1;
         Ok(())
     }
 
@@ -228,9 +305,7 @@ impl Chip8 {
         let register_value = self.registers[register_number as usize];
         let number_in = opcode & 0x00FF;
         if register_value != number_in as u8 {
-            self.pc += 1;
         }
-        self.pc += 1;
         Ok(())
     }
 
@@ -243,9 +318,7 @@ impl Chip8 {
         let vx_value = self.registers[vx as usize];
         let vy_value = self.registers[vy_number as usize];
         if vx_value == vy_value {
-            self.pc += 1;
         }
-        self.pc += 1;
         Ok(())
     }
 
@@ -254,7 +327,6 @@ impl Chip8 {
         let vx = (opcode & 0x0F00) >> 8;
         let number_in = opcode & 0x00FF;
         self.registers[vx as usize] = number_in as u8;
-        self.pc += 1;
         Ok(())
     }
 
@@ -263,7 +335,6 @@ impl Chip8 {
         let vx = (opcode & 0x0F00) >> 8;
         let number_in = opcode & 0x00FF;
         self.registers[vx as usize] += number_in as u8;
-        self.pc += 1;
         Ok(())
     }
 
@@ -272,7 +343,6 @@ impl Chip8 {
         let vx = (opcode & 0x0F00) >> 8;
         let vy_number = (opcode & 0x00F0) >> 4;
         self.registers[vx as usize] = self.registers[vy_number as usize];
-        self.pc += 1;
         Ok(())
     }
 
@@ -281,7 +351,6 @@ impl Chip8 {
         let vx = (opcode & 0x0F00) >> 8;
         let vy = (opcode & 0x00F0) >> 4;
         self.registers[vx as usize] |= self.registers[vy as usize];
-        self.pc += 1;
         Ok(())
     }
 
@@ -290,7 +359,6 @@ impl Chip8 {
         let vx = (opcode & 0x0F00) >> 8;
         let vy = (opcode & 0x00F0) >> 4;
         self.registers[vx as usize] &= self.registers[vy as usize];
-        self.pc += 1;
         Ok(())
     }
 
@@ -299,7 +367,6 @@ impl Chip8 {
         let vx = (opcode & 0x0F00) >> 8;
         let vy = (opcode & 0x00F0) >> 4;
         self.registers[vx as usize] ^= self.registers[vy as usize];
-        self.pc += 1;
         Ok(())
     }
 
@@ -309,7 +376,6 @@ impl Chip8 {
         let vy = (opcode & 0x00F0) >> 4;
 
         self.registers[vx as usize] += self.registers[vy as usize];
-        self.pc += 1;
         Ok(())
     }
 
@@ -318,7 +384,6 @@ impl Chip8 {
         let vx = (opcode & 0x0F00) >> 8;
         let vy = (opcode & 0x00F0) >> 4;
         self.registers[vx as usize] -= self.registers[vy as usize];
-        self.pc += 1;
         Ok(())
     }
 
@@ -328,7 +393,6 @@ impl Chip8 {
         let vx = (opcode & 0x0F00) >> 8;
         self.registers[0xF] = self.registers[vx as usize] & 0b1;
         self.registers[vx as usize] >>= 1;
-        self.pc += 1;
         Ok(())
     }
 
@@ -337,7 +401,6 @@ impl Chip8 {
         let vx = (opcode & 0x0F00) >> 8;
         let vy = (opcode & 0x00F0) >> 4;
         self.registers[vx as usize] = self.registers[vy as usize] - self.registers[vx as usize];
-        self.pc += 1;
         Ok(())
     }
 
@@ -347,7 +410,6 @@ impl Chip8 {
         let vx = (opcode & 0x0F00) >> 8;
         self.registers[0xF] = (self.registers[vx as usize] & 0x80) >> 7;
         self.registers[vx as usize] <<= 1;
-        self.pc += 1;
         Ok(())
     }
 
@@ -360,9 +422,7 @@ impl Chip8 {
         let vx_value = self.registers[vx as usize];
         let vy_value = self.registers[vy_number as usize];
         if vx_value != vy_value {
-            self.pc += 1;
         }
-        self.pc += 1;
         Ok(())
     }
 
@@ -370,15 +430,13 @@ impl Chip8 {
     fn set_i_addr_to_n(&mut self, opcode: u16) -> Result<(), Chip8Error> {
         let n = opcode & 0x0FFF;
         self.address_register = n;
-        self.pc += 1;
         Ok(())
     }
 
     /// I = V0 + n, i.e. sets the I address register to register V0 plus n. Opcode: `BNNN` - `JP V0, addr`.
     fn jump_to_n_plus_v0(&mut self, opcode: u16) -> Result<(), Chip8Error> {
         let n = opcode & 0x0FFF;
-        self.address_register + self.registers[0] as u16 + n;
-        self.pc += 1;
+        self.pc = (self.registers[0] as u16 + n) as usize;
         Ok(())
     }
 
@@ -389,7 +447,6 @@ impl Chip8 {
         let n = opcode & 0x00FF;
         let rand = self.pc + self.current_key as usize + self.stack_pointer as usize;
         self.registers[vx as usize] = (rand as u8) & n as u8;
-        self.pc += 1;
         Ok(())
     }
 
@@ -401,19 +458,39 @@ impl Chip8 {
         let register_vx = (opcode & 0x0F00) >> 8;
         let register_vy = (opcode & 0x00F0) >> 4;
         // Coordinates
-        let x = self.registers[register_vx as usize] as usize;
-        let y = self.registers[register_vy as usize] as usize;
+        let x = self.registers[register_vx as usize] as usize % 64;
+        let y = self.registers[register_vy as usize] as usize % 32;
 
-        for line_nr in 0..height {
-            let sprite = self.mem[self.address_register as usize + line_nr];
-            let display_line = self.display[y + line_nr][x];
-            let new_display_line = display_line ^ sprite;
-            self.display[y + line_nr][x] = new_display_line;
+        // Reset collision flag
+        self.registers[0xF] = 0;
 
-            let flip_from_set_to_unset = new_display_line < display_line; // TODO
-            self.registers[0xF] = flip_from_set_to_unset as u8;
+        for row in 0..height {
+            let sprite = self.mem[self.address_register as usize + row];
+            for col in 0..8 {
+                let pixel_from_u8 = |byte: u8, bit: usize| (byte >> (7 - bit)) & 0b1 == 1;
+                let merge_pixel_into_u8 = |byte: u8, bit: usize, pixel: bool| {
+                    let pixel = pixel as u8;
+                    let mask = 0b1 << (7 - bit);
+                    // First unset the specify bit, then set it to the pixel value
+                    (byte & !mask) | (pixel << (7 - bit))
+                };
+
+                let local_x = ((x + col) % 64) / 8;
+                let local_y = (y + row) % 32;
+
+                let sprite = pixel_from_u8(sprite, col);
+
+                let old_display_pixel = pixel_from_u8(self.display[local_y][local_x], (x + col) % 8);
+                let new_display_pixel = old_display_pixel ^ sprite;
+
+                self.display[local_y][local_x] = merge_pixel_into_u8(self.display[local_y][local_x], (x + col) % 8, new_display_pixel);
+
+                let flip_from_set_to_unset = old_display_pixel && !new_display_pixel;
+                self.registers[0xF] |= flip_from_set_to_unset as u8;
+            }
         }
-        self.pc += 1;
+
+        self.refresh_display = true;
         Ok(())
     }
 
@@ -421,9 +498,7 @@ impl Chip8 {
     fn skip_if_key_in_vk_pressed(&mut self, opcode: u16) -> Result<(), Chip8Error> {
         let vx = (opcode & 0x0F00) >> 8;
         if self.current_key == self.registers[vx as usize] {
-            self.pc += 1;
         }
-        self.pc += 1;
         Ok(())
     }
 
@@ -431,9 +506,7 @@ impl Chip8 {
     fn skip_if_key_in_vk_not_pressed(&mut self, opcode: u16) -> Result<(), Chip8Error> {
         let vx = (opcode & 0x0F00) >> 8;
         if self.current_key != self.registers[vx as usize] {
-            self.pc += 1;
         }
-        self.pc += 1;
         Ok(())
     }
 
@@ -442,7 +515,6 @@ impl Chip8 {
     fn set_vx_to_delay_timer(&mut self, opcode: u16) -> Result<(), Chip8Error> {
         let vx = (opcode & 0x0F00) >> 8;
         self.registers[vx as usize] = self.delay_timer;
-        self.pc += 1;
         Ok(())
     }
 
@@ -452,7 +524,6 @@ impl Chip8 {
         let vx = (opcode & 0x0F00) >> 8;
         let key = 0; // TODO
         self.registers[vx as usize] = key;
-        self.pc += 1;
         Ok(())
     }
 
@@ -460,7 +531,6 @@ impl Chip8 {
     fn set_delay_timer(&mut self, opcode: u16) -> Result<(), Chip8Error> {
         let vx = (opcode & 0x0F00) >> 8;
         self.delay_timer = self.registers[vx as usize];
-        self.pc += 1;
         Ok(())
     }
 
@@ -468,7 +538,6 @@ impl Chip8 {
     fn set_sound_timer(&mut self, opcode: u16) -> Result<(), Chip8Error> {
         let vx = (opcode & 0x0F00) >> 8;
         self.sound_timer = self.registers[vx as usize];
-        self.pc += 1;
         Ok(())
     }
 
@@ -476,7 +545,6 @@ impl Chip8 {
     fn add_vx_to_i(&mut self, opcode: u16) -> Result<(), Chip8Error> {
         let vx = (opcode & 0x0F00) >> 8;
         self.address_register += self.registers[vx as usize] as u16;
-        self.pc += 1;
         Ok(())
     }
 
@@ -485,7 +553,6 @@ impl Chip8 {
     fn set_addr_register_to_char(&mut self, opcode: u16) -> Result<(), Chip8Error> {
         let vx = (opcode & 0x0F00) >> 8;
         self.address_register = vx * 5; // Each char uses 5 bytes of memory
-        self.pc += 1;
         Ok(())
     }
 
@@ -497,7 +564,6 @@ impl Chip8 {
         self.mem[self.address_register as usize] = vx_value / 100; // Most significant bit
         self.mem[(self.address_register + 1) as usize] = (vx_value / 10) % 10;
         self.mem[(self.address_register + 2) as usize] = vx_value % 10; // Least significant bit
-        self.pc += 1;
         Ok(())
     }
 
@@ -508,7 +574,6 @@ impl Chip8 {
         for vi in 0..=vx {
             self.mem[self.address_register as usize + vi] = self.registers[vi];
         }
-        self.pc += 1;
         Ok(())
     }
 
@@ -519,16 +584,18 @@ impl Chip8 {
         for vi in 0..=vx {
             self.registers[vi] = self.mem[self.address_register as usize + vi];
         }
-        self.pc += 1;
         Ok(())
     }
 }
 
-fn main() {
+fn main() -> Result<(), Box<dyn Error>> {
     let file_path = "src/PONG";
     let mut file = File::open(file_path).expect("Can't open program file");
     let mut program = Vec::new();
     file.read_to_end(&mut program).expect("Can't read program from file");
     let mut chip8 = Chip8::new(&program);
-    chip8.run();
+    if let Err(err) = chip8.run() {
+        println!("Error: {}", err);
+    }
+    Ok(())
 }
